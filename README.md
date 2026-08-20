@@ -156,6 +156,10 @@ Managed in [`app/config.py`](app/config.py) and loaded from the environment:
 -   `GCP_LOCATION`: Optional. Explicitly set the Google Cloud Location (region). If not set, attempts to infer or uses Vertex AI defaults.
 -   `FAKE_STREAMING`: Optional. Set to `"true"` to simulate streaming output for testing. (Default: `"false"`)
 -   `FAKE_STREAMING_INTERVAL`: Optional. Interval (seconds) for keep-alive messages during fake streaming. (Default: `1.0`)
+-   `RETRY_ENABLED`: Optional. Enables retrying transient upstream failures. (Default: `"true"`)
+-   `RETRY_MAX_ATTEMPTS`: Optional. Total attempts including the initial request. (Default: `20`)
+-   `RETRY_INTERVAL_MS`: Optional. Fixed delay between retry attempts in milliseconds. (Default: `500`)
+-   `RETRY_STATUS_CODES`: Optional. Comma-separated HTTP statuses that should be retried. (Default: `408,409,425,429,500,502,503,504`)
 
 ## License
 

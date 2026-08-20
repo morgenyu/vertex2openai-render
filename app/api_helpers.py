@@ -19,6 +19,7 @@ from message_processing import (
 )
 import config as app_config
 from config import VERTEX_REASONING_TAG
+from retry_utils import async_iter_with_retry, retry_async
 
 class StreamingReasoningProcessor:
     def __init__(self, tag_name: str = VERTEX_REASONING_TAG):
@@ -281,11 +282,17 @@ async def gemini_fake_stream_generator(
     model_name_for_log = getattr(gemini_client_instance, 'model_name', 'unknown_gemini_model_object')
     print(f"FAKE STREAMING (Gemini): Prep for '{request_obj.model}' (API model string: '{model_for_api_call}', client obj: '{model_name_for_log}')")
     
-    api_call_task = asyncio.create_task(
-        gemini_client_instance.aio.models.generate_content(
+    async def _generate_content_with_retry():
+        return await gemini_client_instance.aio.models.generate_content(
             model=model_for_api_call, 
             contents=prompt_for_api_call, 
             config=gen_config_dict_for_api_call # Pass the dictionary directly
+        )
+
+    api_call_task = asyncio.create_task(
+        retry_async(
+            _generate_content_with_retry,
+            f"Gemini fake-stream request for {model_for_api_call}",
         )
     )
 
@@ -343,7 +350,12 @@ async def openai_fake_stream_generator(
         params_for_call['stream'] = False 
         return await openai_client.chat.completions.create(**params_for_call, extra_body=openai_extra_body)
 
-    api_call_task = asyncio.create_task(_openai_api_call_task())
+    api_call_task = asyncio.create_task(
+        retry_async(
+            _openai_api_call_task,
+            f"OpenAI-compatible fake-stream request for {api_model_name}",
+        )
+    )
     outer_keep_alive_interval = app_config.FAKE_STREAMING_INTERVAL_SECONDS
     if outer_keep_alive_interval > 0:
         while not api_call_task.done():
@@ -425,12 +437,17 @@ async def execute_gemini_call(
             response_id_for_stream = f"chatcmpl-realstream-{int(time.time())}"
             async def _gemini_real_stream_generator_inner():
                 try:
-                    stream_gen_obj = await current_client.aio.models.generate_content_stream(
-                        model=model_to_call, 
-                        contents=actual_prompt_for_call,
-                        config=gen_config_dict # Pass the dictionary directly
-                    )
-                    async for chunk_item_call in stream_gen_obj:
+                    async def _create_stream():
+                        return await current_client.aio.models.generate_content_stream(
+                            model=model_to_call,
+                            contents=actual_prompt_for_call,
+                            config=gen_config_dict,
+                        )
+
+                    async for chunk_item_call in async_iter_with_retry(
+                        _create_stream,
+                        f"Gemini streaming request for {model_to_call}",
+                    ):
                         yield convert_chunk_to_openai(chunk_item_call, request_obj.model, response_id_for_stream, 0)
                     yield "data: [DONE]\n\n"
                 except Exception as e_stream_call:
@@ -445,10 +462,16 @@ async def execute_gemini_call(
                     raise e_stream_call
             return StreamingResponse(_gemini_real_stream_generator_inner(), media_type="text/event-stream")
     else: # Non-streaming
-        response_obj_call = await current_client.aio.models.generate_content(
-            model=model_to_call, 
-            contents=actual_prompt_for_call,
-            config=gen_config_dict # Pass the dictionary directly
+        async def _generate_content():
+            return await current_client.aio.models.generate_content(
+                model=model_to_call,
+                contents=actual_prompt_for_call,
+                config=gen_config_dict,
+            )
+
+        response_obj_call = await retry_async(
+            _generate_content,
+            f"Gemini request for {model_to_call}",
         )
         if hasattr(response_obj_call, 'prompt_feedback') and \
            hasattr(response_obj_call.prompt_feedback, 'block_reason') and \

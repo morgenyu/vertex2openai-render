@@ -1,5 +1,32 @@
 import os
 
+
+def _get_int_env(name: str, default: int, minimum: int = 0) -> int:
+    """Read an integer environment variable with a safe lower bound."""
+    raw_value = os.environ.get(name)
+    if raw_value is None:
+        return default
+    try:
+        return max(minimum, int(raw_value))
+    except (TypeError, ValueError):
+        print(f"WARNING: Invalid integer value for {name}; using default {default}.")
+        return default
+
+
+def _get_status_codes_env(name: str, default: str) -> set[int]:
+    """Read a comma-separated set of HTTP status codes."""
+    raw_value = os.environ.get(name, default)
+    status_codes = set()
+    for item in raw_value.split(','):
+        item = item.strip()
+        if not item:
+            continue
+        try:
+            status_codes.add(int(item))
+        except ValueError:
+            print(f"WARNING: Ignoring invalid HTTP status code '{item}' in {name}.")
+    return status_codes
+
 # Default password if not set in environment
 DEFAULT_PASSWORD = "123456"
 
@@ -43,3 +70,13 @@ SAFETY_SCORE = os.environ.get("SAFETY_SCORE", "false").lower() == "true"
 # Proxy settings
 PROXY_URL = os.environ.get("PROXY_URL")
 SSL_CERT_FILE = os.environ.get("SSL_CERT_FILE")
+
+# Retry settings for transient upstream failures. RETRY_MAX_ATTEMPTS includes
+# the initial request, so a value of 20 means at most 20 total attempts.
+RETRY_ENABLED = os.environ.get("RETRY_ENABLED", "true").lower() == "true"
+RETRY_MAX_ATTEMPTS = _get_int_env("RETRY_MAX_ATTEMPTS", 20, minimum=1)
+RETRY_INTERVAL_MS = _get_int_env("RETRY_INTERVAL_MS", 500, minimum=0)
+RETRY_STATUS_CODES = _get_status_codes_env(
+    "RETRY_STATUS_CODES",
+    "408,409,425,429,500,502,503,504",
+)

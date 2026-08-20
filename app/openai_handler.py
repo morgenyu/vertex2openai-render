@@ -21,6 +21,7 @@ from api_helpers import (
 from message_processing import extract_reasoning_by_tags
 from credentials_manager import _refresh_auth
 from project_id_discovery import discover_project_id
+from retry_utils import async_iter_with_retry, retry_async
 
 
 # Wrapper classes to mimic OpenAI SDK responses for direct httpx calls
@@ -182,6 +183,7 @@ class OpenAIDirectHandler:
             base_url=endpoint_url,
             api_key=gcp_token,  # OAuth token
             http_client=http_client,
+            max_retries=0,  # Retry count is controlled centrally by retry_utils.
         )
     
     def prepare_openai_params(self, request: OpenAIRequest, model_id: str, is_openai_search: bool = False) -> Dict[str, Any]:
@@ -257,17 +259,21 @@ class OpenAIDirectHandler:
         try:
             # Ensure stream=True is explicitly passed for real streaming
             openai_params_for_stream = {**openai_params, "stream": True}
-            stream_response = await openai_client.chat.completions.create(
-                **openai_params_for_stream,
-                extra_body=openai_extra_body
-            )
+            async def _create_stream():
+                return await openai_client.chat.completions.create(
+                    **openai_params_for_stream,
+                    extra_body=openai_extra_body,
+                )
             
             # Create processor for tag-based extraction across chunks
             reasoning_processor = StreamingReasoningProcessor(VERTEX_REASONING_TAG)
             chunk_count = 0
             has_sent_content = False
             
-            async for chunk in stream_response:
+            async for chunk in async_iter_with_retry(
+                _create_stream,
+                f"OpenAI-compatible streaming request for {request.model}",
+            ):
                 chunk_count += 1
                 try:
                     chunk_as_dict = chunk.model_dump(exclude_unset=True, exclude_none=True)
@@ -402,9 +408,15 @@ class OpenAIDirectHandler:
         try:
             # Ensure stream=False is explicitly passed
             openai_params_non_stream = {**openai_params, "stream": False}
-            response = await openai_client.chat.completions.create(
-                **openai_params_non_stream,
-                extra_body=openai_extra_body
+            async def _create_completion():
+                return await openai_client.chat.completions.create(
+                    **openai_params_non_stream,
+                    extra_body=openai_extra_body,
+                )
+
+            response = await retry_async(
+                _create_completion,
+                f"OpenAI-compatible request for {request.model}",
             )
             response_dict = response.model_dump(exclude_unset=True, exclude_none=True)
             

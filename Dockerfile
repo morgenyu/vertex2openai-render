@@ -15,6 +15,5 @@ RUN mkdir -p /app/credentials
 # Expose the port
 EXPOSE 8050
 
-# Command to run the application
-# Use the default Hugging Face port 7860
-CMD ["uvicorn", "main:app", "--host", "0.0.0.0", "--port", "7860"]
+# Use Render's injected PORT when available, while preserving the local default.
+CMD ["sh", "-c", "uvicorn main:app --host 0.0.0.0 --port ${PORT:-7860}"]

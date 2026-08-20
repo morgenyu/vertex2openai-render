@@ -3,6 +3,7 @@ import json
 import re
 from typing import Dict, Optional
 import config
+from retry_utils import retry_async
 
 # Global cache for project IDs: {api_key: project_id}
 PROJECT_ID_CACHE: Dict[str, str] = {}
@@ -32,6 +33,14 @@ async def discover_project_id(api_key: str) -> str:
         print(f"INFO: Using cached project ID: {PROJECT_ID_CACHE[api_key]}")
         return PROJECT_ID_CACHE[api_key]
     
+    return await retry_async(
+        lambda: _discover_project_id_once(api_key),
+        "Vertex Express project ID discovery",
+    )
+
+
+async def _discover_project_id_once(api_key: str) -> str:
+    """Perform one project-ID discovery request."""
     # Use a non-existent model to trigger error
     error_url = f"https://aiplatform.googleapis.com/v1/publishers/google/models/gemini-2.7-pro-preview-05-06:streamGenerateContent?key={api_key}"
     

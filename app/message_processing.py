@@ -375,6 +375,29 @@ def parse_gemini_response_for_reasoning_and_content(gemini_response_candidate: A
                 reasoning_text_parts.append(part_text)
             elif part_text: # Only add if it's not a function_call and has text
                 normal_text_parts.append(part_text)
+            
+            # Handle inline_data (images)
+            if hasattr(part_item, 'inline_data') and part_item.inline_data:
+                inline_data = part_item.inline_data
+                mime_type = getattr(inline_data, 'mime_type', 'image/png')
+                data = getattr(inline_data, 'data', None)
+                if data:
+                    b64_str = ""
+                    if isinstance(data, bytes):
+                        b64_str = base64.b64encode(data).decode('utf-8')
+                    elif isinstance(data, str):
+                        b64_str = data
+                    
+                    if b64_str:
+                        normal_text_parts.append(f"\n![Generated Image](data:{mime_type};base64,{b64_str})\n")
+
+            # Handle file_data (URI references)
+            if hasattr(part_item, 'file_data') and part_item.file_data:
+                file_data = part_item.file_data
+                file_uri = getattr(file_data, 'file_uri', '')
+                mime_type = getattr(file_data, 'mime_type', 'application/octet-stream')
+                if file_uri:
+                    normal_text_parts.append(f"\n[File: {file_uri} ({mime_type})]\n")
     elif candidate_part_text:
         normal_text_parts.append(candidate_part_text)
     elif gemini_candidate_content and hasattr(gemini_candidate_content, 'text') and gemini_candidate_content.text is not None:
