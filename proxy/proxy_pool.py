@@ -1,6 +1,7 @@
 """Sticky, per-project Mihomo selector used only at startup and before retries."""
 
 import asyncio
+from collections import Counter
 import logging
 import os
 import random
@@ -43,6 +44,9 @@ class ProxyPool:
         self.secret = os.environ.get("PROXY_CONTROLLER_SECRET", "")
         self.group = os.environ.get("PROXY_GROUP", "VERTEX-OUT")
         self.provider = os.environ.get("PROXY_PROVIDER", "subscription")
+        self.providers = list(dict.fromkeys(name.strip() for name in
+                              os.environ.get("PROXY_PROVIDERS", self.provider).split(",") if name.strip()))
+        self.node_providers = {}
         self.test_url = os.environ.get("PROXY_TEST_URL", "https://www.google.com/generate_204")
         self.probe_ms = int(os.environ.get("PROXY_TEST_TIMEOUT_MS", "4000"))
         self.rotation_timeout = float(os.environ.get("PROXY_ROTATION_TIMEOUT", "30"))
@@ -69,13 +73,15 @@ class ProxyPool:
     async def _probe(self, client, name):
         try:
             # Provider nodes are not present in Mihomo's top-level /proxies map.
-            path = f"/providers/proxies/{quote(self.provider, safe='')}/{quote(name, safe='')}/healthcheck"
+            provider = self.node_providers.get(name, self.provider)
+            path = f"/providers/proxies/{quote(provider, safe='')}/{quote(name, safe='')}/healthcheck"
             response = await client.get(path, params={
                 "url": self.test_url, "timeout": self.probe_ms, "expected-status": "204",
             })
             response.raise_for_status()
             delay = response.json().get("delay")
             if isinstance(delay, (int, float)) and not isinstance(delay, bool) and delay >= 0:
+                self.cooldowns.pop(name, None)
                 return True
         except (httpx.HTTPError, ValueError):
             pass
@@ -90,21 +96,46 @@ class ProxyPool:
         # Do not DELETE /connections: healthy concurrent streams must keep running.
         LOG.info("[Proxy pool] Selected %s (generation %s)", name, self.generation)
 
-    async def _choose(self, failed):
+    async def _inventory(self, client):
+        group_response = await client.get(f"/proxies/{quote(self.group, safe='')}")
+        group_response.raise_for_status()
+        group = group_response.json()
+        responses = await asyncio.gather(*(client.get(f"/providers/proxies/{quote(provider, safe='')}")
+                                          for provider in self.providers), return_exceptions=True)
+        # Only actual leaf proxies belonging to this selector; never DIRECT/REJECT/groups.
+        allowed = {"ss", "ssr", "shadowsocks", "shadowsocksr", "vmess", "vless", "trojan",
+                   "hysteria", "hysteria2", "tuic", "wireguard", "socks5", "http", "ssh",
+                   "mieru", "anytls", "snell"}
+        available = set(group.get("all", []))
+        inventory = {}
+        for provider, response in zip(self.providers, responses):
+            try:
+                if isinstance(response, Exception):
+                    raise response
+                response.raise_for_status()
+                entries = response.json().get("proxies", [])
+                inventory[provider] = list(dict.fromkeys(p["name"] for p in entries
+                    if p.get("name") in available and str(p.get("type", "")).lower() in allowed))
+            except (httpx.HTTPError, ValueError):
+                inventory[provider] = None
+        # Prefixes in Render normally prevent collisions. Refuse ambiguous names
+        # if another/local configuration lacks them rather than probing the wrong node.
+        counts = Counter(name for names in inventory.values() for name in (names or []))
+        inventory = {provider: None if names is None else [name for name in names if counts[name] == 1]
+                     for provider, names in inventory.items()}
+        self.node_providers = {name: provider for provider, names in inventory.items() for name in (names or [])}
+        return group, inventory
+
+    def _validate_provider(self, provider):
+        if provider is not None and provider not in self.providers:
+            raise ValueError("Unknown proxy provider")
+
+    async def _choose(self, failed, provider=None):
+        self._validate_provider(provider)
         async with self._client() as client:
-            group_response = await client.get(f"/proxies/{quote(self.group, safe='')}")
-            group_response.raise_for_status()
-            group = group_response.json()
-            response = await client.get(f"/providers/proxies/{quote(self.provider, safe='')}")
-            response.raise_for_status()
-            entries = response.json().get("proxies", [])
-            # Only actual leaf proxies from this provider; never DIRECT/REJECT/groups.
-            allowed = {"ss", "ssr", "shadowsocks", "shadowsocksr", "vmess", "vless", "trojan",
-                       "hysteria", "hysteria2", "tuic", "wireguard", "socks5", "http", "ssh",
-                       "mieru", "anytls", "snell"}
-            available = set(group.get("all", []))
-            names = list(dict.fromkeys(p["name"] for p in entries
-                         if p.get("name") in available and str(p.get("type", "")).lower() in allowed))
+            group, inventory = await self._inventory(client)
+            names = [name for key, entries in inventory.items() if provider is None or key == provider
+                     for name in (entries or [])]
             now = time.monotonic()
             self.cooldowns = {name: expiry for name, expiry in self.cooldowns.items() if expiry > now}
             current = group.get("now")
@@ -144,9 +175,30 @@ class ProxyPool:
             except (httpx.HTTPError, asyncio.TimeoutError) as exc:
                 raise ProxyPoolUnavailable("Could not initialize a healthy proxy node.") from exc
 
-    async def rotate(self, failed_generation):
+    async def check(self, provider=None):
+        self._validate_provider(provider)
+        async with self._client() as client:
+            _, inventory = await self._inventory(client)
+            report = {}
+            for key, names in inventory.items():
+                if provider is not None and key != provider:
+                    continue
+                healthy = 0
+                for offset in range(0, len(names or []), self.batch_size):
+                    results = await asyncio.gather(*(self._probe(client, name)
+                        for name in names[offset:offset + self.batch_size]))
+                    healthy += sum(results)
+                report[key] = {"available": names is not None, "node_count": len(names or []),
+                               "checked": len(names or []), "healthy": healthy,
+                               "unhealthy": len(names or []) - healthy}
+            return {"providers": report, "test_url": self.test_url,
+                    "checked": sum(item["checked"] for item in report.values()),
+                    "healthy": sum(item["healthy"] for item in report.values())}
+
+    async def rotate(self, failed_generation, provider=None):
         if not self.enabled:
             return
+        self._validate_provider(provider)
         async with self._lock:
             # Concurrent failures on the same old node cause only one selection change.
             if failed_generation != self.generation:
@@ -156,7 +208,7 @@ class ProxyPool:
                 self.cooldowns[failed] = time.monotonic() + self.cooldown
             LOG.warning("[Proxy pool] Upstream retry: cooling down %s and finding another node", failed)
             try:
-                await asyncio.wait_for(self._choose(failed), timeout=self.rotation_timeout)
+                await asyncio.wait_for(self._choose(failed, provider), timeout=self.rotation_timeout)
             except (httpx.HTTPError, asyncio.TimeoutError) as exc:
                 raise ProxyPoolUnavailable("Could not select a healthy replacement proxy node.") from exc
 

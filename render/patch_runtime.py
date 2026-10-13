@@ -126,7 +126,22 @@ def patch(root):
     main = replace_once(main, "    await refresh_models_config_cache()\n",
                         "    await proxy_pool.start()\n    await refresh_models_config_cache()\n")
     main += '\n\n@app.get("/health")\nasync def render_health():\n    return {"status": "ok", "base_image": "sha256:67c110e477d8d92da5e11034d9f3cdf6cedaec437afabcec64cef26710bea21e"}\n'
-    main += '\n\nimport render_egress\n\n@app.get("/api/egress")\nasync def render_egress_status(_auth: bool = Depends(require_auth)):\n    return await render_egress.status()\n\n@app.post("/api/egress/rotate")\nasync def render_rotate_egress(_auth: bool = Depends(require_auth)):\n    return await render_egress.rotate()\n'
+    main += '''
+
+import render_egress
+
+@app.get("/api/egress")
+async def render_egress_status(_auth: bool = Depends(require_auth)):
+    return await render_egress.status()
+
+@app.post("/api/egress/rotate")
+async def render_rotate_egress(provider: str | None = None, _auth: bool = Depends(require_auth)):
+    return await render_egress.rotate(provider)
+
+@app.post("/api/egress/check")
+async def render_check_egress(provider: str | None = None, _auth: bool = Depends(require_auth)):
+    return await render_egress.check(provider)
+'''
     compile(main, str(main_path), "exec")
     main_path.write_text(main, encoding="utf-8")
 

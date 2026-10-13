@@ -15,16 +15,22 @@ class PoolTests(unittest.IsolatedAsyncioTestCase):
         self.selected = "old"
         self.dead = {"dead"}
         self.probes = []
+        self.probe_paths = []
         self.selections = []
+        self.nodes = {"subscription": [("old", "Vless"), ("dead", "Vless"),
+                                       ("good", "Vless"), ("DIRECT", "Direct")]}
+        self.offline_providers = set()
 
         async def controller(request):
             path = request.url.path
             if path == "/version":
                 return httpx.Response(200, json={"version": "test"})
-            if path == "/providers/proxies/subscription":
+            if path.startswith("/providers/proxies/") and path.count("/") == 3:
+                provider = path.rsplit("/", 1)[-1]
+                if provider in self.offline_providers:
+                    return httpx.Response(503)
                 return httpx.Response(200, json={"proxies": [
-                    {"name": name, "type": kind} for name, kind in
-                    [("old", "Vless"), ("dead", "Vless"), ("good", "Vless"), ("DIRECT", "Direct")]
+                    {"name": name, "type": kind} for name, kind in self.nodes[provider]
                 ]})
             if path == "/proxies/VERTEX-OUT":
                 if request.method == "PUT":
@@ -32,10 +38,14 @@ class PoolTests(unittest.IsolatedAsyncioTestCase):
                     self.selected = json.loads(request.content)["name"]
                     self.selections.append(self.selected)
                     return httpx.Response(204)
-                return httpx.Response(200, json={"now": self.selected, "all": ["old", "dead", "good", "DIRECT"]})
-            if path.startswith("/providers/proxies/subscription/") and path.endswith("/healthcheck"):
+                return httpx.Response(200, json={"now": self.selected,
+                    "all": [name for entries in self.nodes.values() for name, _ in entries]})
+            if path.startswith("/providers/proxies/") and path.endswith("/healthcheck"):
+                provider = path.split("/")[-3]
                 name = path.split("/")[-2]
+                self.assertIn(name, [entry[0] for entry in self.nodes[provider]])
                 self.probes.append(name)
+                self.probe_paths.append((provider, name))
                 self.assertEqual(request.url.params["expected-status"], "204")
                 return httpx.Response(503 if name in self.dead else 200,
                                       json={"message": "offline"} if name in self.dead else {"delay": 12})
@@ -86,6 +96,59 @@ class PoolTests(unittest.IsolatedAsyncioTestCase):
         await self.pool.start()
         await self.pool.rotate(0)
         self.assertEqual(self.probes, [])
+
+    def add_secondary(self):
+        self.pool.providers.append("subscription-2")
+        self.nodes["subscription-2"] = [("new", "Hysteria2"), ("new-dead", "Tuic")]
+        self.dead.add("new-dead")
+
+    async def test_selecting_secondary_probes_the_correct_provider(self):
+        self.add_secondary()
+        await self.pool.start()
+        await self.pool.rotate(self.pool.generation, "subscription-2")
+        self.assertEqual(self.selected, "new")
+        self.assertEqual(self.pool.node_providers["new"], "subscription-2")
+        self.assertEqual(self.probe_paths[-1], ("subscription-2", "new"))
+
+    async def test_unavailable_primary_does_not_block_secondary(self):
+        self.add_secondary()
+        self.offline_providers.add("subscription")
+        await self.pool.start()
+        self.assertEqual(self.selected, "new")
+        self.assertEqual(self.probe_paths, [("subscription-2", "new")])
+
+    async def test_unavailable_secondary_does_not_block_primary(self):
+        self.add_secondary()
+        self.offline_providers.add("subscription-2")
+        await self.pool.start()
+        self.assertEqual(self.selected, "old")
+
+    async def test_duplicate_names_are_never_probed_or_selected(self):
+        self.add_secondary()
+        self.nodes["subscription-2"].insert(0, ("old", "Vless"))
+        await self.pool.start()
+        self.assertEqual(self.selected, "good")
+        self.assertNotIn("old", self.probes)
+        self.assertNotIn("old", self.pool.node_providers)
+
+    async def test_check_reports_secondary_health_without_changing_selection(self):
+        self.add_secondary()
+        await self.pool.start()
+        generation = self.pool.generation
+        report = await self.pool.check("subscription-2")
+        self.assertEqual(report["checked"], 2)
+        self.assertEqual(report["healthy"], 1)
+        self.assertEqual(report["providers"]["subscription-2"]["unhealthy"], 1)
+        self.assertNotIn("subscription", report["providers"])
+        self.assertEqual(self.selected, "old")
+        self.assertEqual(self.pool.generation, generation)
+
+    async def test_unknown_provider_fails_before_cooling_current_node(self):
+        await self.pool.start()
+        with self.assertRaises(ValueError):
+            await self.pool.rotate(self.pool.generation, "unknown")
+        self.assertNotIn("old", self.pool.cooldowns)
+        self.assertEqual(self.selected, "old")
 
     def test_error_classification(self):
         for code in (408, 429, 500, 502, 503, 504):

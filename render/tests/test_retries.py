@@ -68,13 +68,13 @@ class RenderRetryTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(response.status_code, 200)
         self.assertEqual(method.await_count, 2)
 
-    async def test_nonstream_429_waits_progressively_and_caps_at_five_seconds(self):
+    async def test_nonstream_429_waits_progressively_and_caps_at_three_seconds(self):
         with patch.object(helpers, "get_retry_settings", return_value=(8, 0.5)), \
                 patch.object(helpers.asyncio, "sleep", new_callable=AsyncMock) as sleep:
             method, response = await self.express([*[status_error(429) for _ in range(8)], SimpleNamespace()])
         self.assertEqual(response.status_code, 200)
         self.assertEqual(method.await_count, 9)
-        self.assertEqual(sleep.await_args_list, [call(delay) for delay in (0.5, 1, 2, 4, 5, 5, 5, 5)])
+        self.assertEqual(sleep.await_args_list, [call(delay) for delay in (0.5, 1, 2, 3, 3, 3, 3, 3)])
 
     async def test_thirty_retries_stop_after_thirty_one_upstream_requests(self):
         method = AsyncMock(side_effect=[status_error(429) for _ in range(31)])
@@ -161,7 +161,7 @@ class RenderRetryTests(unittest.IsolatedAsyncioTestCase):
             response = await cookie.CookieProxyUpstream().chat_completions(self.request, self.connected)
         self.assertEqual(response.status_code, 400)
         self.assertEqual(client.post.await_count, 9)
-        self.assertEqual(sleep.await_args_list, [call(delay) for delay in (0.5, 1, 2, 4, 5, 5, 5, 5)])
+        self.assertEqual(sleep.await_args_list, [call(delay) for delay in (0.5, 1, 2, 3, 3, 3, 3, 3)])
 
     async def test_cookie_stream_retries_before_content_and_never_replays(self):
         self.cookie_setup()
@@ -199,13 +199,13 @@ class PolicySettingsTests(unittest.TestCase):
 
     def test_progressive_delay_stays_at_the_cap_through_thirty_retries(self):
         delays = [render_retry.retry_delay(attempt, 0.5) for attempt in range(30)]
-        self.assertEqual(delays[:6], [0.5, 1, 2, 4, 5, 5])
-        self.assertEqual(max(delays), 5)
-        self.assertEqual(sum(delays), 137.5)
+        self.assertEqual(delays[:6], [0.5, 1, 2, 3, 3, 3])
+        self.assertEqual(max(delays), 3)
+        self.assertEqual(sum(delays), 84.5)
 
     def test_zero_delay_and_console_delay_above_the_cap(self):
         self.assertEqual(render_retry.retry_delay(30, 0), 0)
-        self.assertEqual(render_retry.retry_delay(0, 20), 5)
+        self.assertEqual(render_retry.retry_delay(0, 20), 3)
 
     def test_sdk_does_not_add_hidden_retries(self):
         self.assertEqual(http_options.get_http_options().retry_options.attempts, 1)

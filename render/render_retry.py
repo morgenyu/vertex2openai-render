@@ -16,7 +16,7 @@ def _number(name, default, minimum, maximum, cast):
 RETRY_ENABLED = os.environ.get("RETRY_ENABLED", "true").lower() == "true"
 DEFAULT_RETRY_MAX = _number("RETRY_MAX_ATTEMPTS", 11, 1, 51, int) - 1
 DEFAULT_BACKOFF = _number("RETRY_INTERVAL_MS", 5000, 0, 120000, float) / 1000
-MAX_BACKOFF = _number("RETRY_MAX_BACKOFF_MS", 5000, 0, 120000, float) / 1000
+MAX_BACKOFF = _number("RETRY_MAX_BACKOFF_MS", 3000, 0, 120000, float) / 1000
 _DEFAULT_STATUSES = {408, 409, 425, 429, 500, 502, 503, 504}
 try:
     RETRY_STATUS_CODES = {
