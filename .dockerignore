@@ -3,3 +3,7 @@
 !render/
 !render/render_retry.py
 !render/patch_runtime.py
+!render/entrypoint.py
+!render/egress.py
+!proxy/
+!proxy/proxy_pool.py

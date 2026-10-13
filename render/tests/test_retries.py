@@ -2,7 +2,7 @@
 import unittest
 from contextlib import ExitStack
 from types import SimpleNamespace
-from unittest.mock import AsyncMock, patch
+from unittest.mock import AsyncMock, call, patch
 
 import httpx
 from google.genai import errors as genai_errors
@@ -25,8 +25,10 @@ class RenderRetryTests(unittest.IsolatedAsyncioTestCase):
     def setUp(self):
         self.stack = ExitStack()
         self.addCleanup(self.stack.close)
+        self.pool = SimpleNamespace(enabled=True, generation=1, rotate=AsyncMock())
         for module in (helpers, cookie):
             self.stack.enter_context(patch.object(module, "get_retry_settings", return_value=(2, 0)))
+            self.stack.enter_context(patch.object(module, "proxy_pool", self.pool))
         self.stack.enter_context(patch.object(helpers, "is_gemini_response_valid", return_value=True))
         self.stack.enter_context(patch.object(helpers, "convert_to_openai_format", return_value={"choices": []}))
         self.stack.enter_context(patch.object(helpers, "convert_chunk_to_openai", return_value="data: unique\n\n"))
@@ -51,18 +53,37 @@ class RenderRetryTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(response.status_code, 200)
         self.assertEqual(method.await_count, 1)
         self.retry_stat.assert_not_called()
+        self.pool.rotate.assert_not_awaited()
 
     async def test_429_retries_then_succeeds(self):
         method, response = await self.express([status_error(429), SimpleNamespace()])
         self.assertEqual(response.status_code, 200)
         self.assertEqual(method.await_count, 2)
         self.retry_stat.assert_called_once()
+        self.pool.rotate.assert_awaited_once_with(1)
 
     async def test_sdk_429_retries_then_succeeds(self):
         error = genai_errors.ClientError(429, {"error": {"message": "Quota exceeded", "status": "RESOURCE_EXHAUSTED"}})
         method, response = await self.express([error, SimpleNamespace()])
         self.assertEqual(response.status_code, 200)
         self.assertEqual(method.await_count, 2)
+
+    async def test_nonstream_429_waits_progressively_and_caps_at_five_seconds(self):
+        with patch.object(helpers, "get_retry_settings", return_value=(8, 0.5)), \
+                patch.object(helpers.asyncio, "sleep", new_callable=AsyncMock) as sleep:
+            method, response = await self.express([*[status_error(429) for _ in range(8)], SimpleNamespace()])
+        self.assertEqual(response.status_code, 200)
+        self.assertEqual(method.await_count, 9)
+        self.assertEqual(sleep.await_args_list, [call(delay) for delay in (0.5, 1, 2, 4, 5, 5, 5, 5)])
+
+    async def test_thirty_retries_stop_after_thirty_one_upstream_requests(self):
+        method = AsyncMock(side_effect=[status_error(429) for _ in range(31)])
+        client = SimpleNamespace(aio=SimpleNamespace(models=SimpleNamespace(generate_content=method)))
+        with patch.object(helpers, "get_retry_settings", return_value=(30, 0)), self.assertRaises(httpx.HTTPStatusError):
+            await helpers.execute_gemini_call(client, self.request.model, lambda _: [], {}, self.request)
+        self.assertEqual(method.await_count, 31)
+        self.assertEqual(self.retry_stat.call_count, 30)
+        self.assertEqual(self.pool.rotate.await_count, 30)
 
     async def test_exhausted_retries_stop_at_configured_attempt_count(self):
         method = AsyncMock(side_effect=[status_error(429) for _ in range(3)])
@@ -131,6 +152,17 @@ class RenderRetryTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(client.post.await_count, 2)
         self.retry_stat.assert_called_once()
 
+    async def test_cookie_nonstream_uses_the_same_progressive_delay(self):
+        client = self.cookie_setup()
+        client.post.side_effect = [*[httpx.Response(429, text="busy") for _ in range(8)],
+                                   httpx.Response(400, text="invalid request")]
+        with patch.object(cookie, "get_retry_settings", return_value=(8, 0.5)), \
+                patch.object(cookie.asyncio, "sleep", new_callable=AsyncMock) as sleep:
+            response = await cookie.CookieProxyUpstream().chat_completions(self.request, self.connected)
+        self.assertEqual(response.status_code, 400)
+        self.assertEqual(client.post.await_count, 9)
+        self.assertEqual(sleep.await_args_list, [call(delay) for delay in (0.5, 1, 2, 4, 5, 5, 5, 5)])
+
     async def test_cookie_stream_retries_before_content_and_never_replays(self):
         self.cookie_setup()
         self.request.stream = True
@@ -162,11 +194,26 @@ class RenderRetryTests(unittest.IsolatedAsyncioTestCase):
 
 class PolicySettingsTests(unittest.TestCase):
     def test_existing_render_environment_defaults(self):
-        self.assertEqual(config.DEFAULT_SETTINGS["retry_max"], 19)
+        self.assertEqual(config.DEFAULT_SETTINGS["retry_max"], 30)
         self.assertEqual(config.DEFAULT_SETTINGS["retry_backoff_seconds"], 0.5)
+
+    def test_progressive_delay_stays_at_the_cap_through_thirty_retries(self):
+        delays = [render_retry.retry_delay(attempt, 0.5) for attempt in range(30)]
+        self.assertEqual(delays[:6], [0.5, 1, 2, 4, 5, 5])
+        self.assertEqual(max(delays), 5)
+        self.assertEqual(sum(delays), 137.5)
+
+    def test_zero_delay_and_console_delay_above_the_cap(self):
+        self.assertEqual(render_retry.retry_delay(30, 0), 0)
+        self.assertEqual(render_retry.retry_delay(0, 20), 5)
 
     def test_sdk_does_not_add_hidden_retries(self):
         self.assertEqual(http_options.get_http_options().retry_options.attempts, 1)
+
+    def test_proxy_retries_open_a_new_connect_tunnel(self):
+        with patch.object(http_options.proxy_pool, "controller", "http://controller"):
+            options = http_options.get_http_options()
+        self.assertEqual(options.async_client_args["limits"].max_keepalive_connections, 0)
 
     def test_disabled_retries_still_allow_one_attempt(self):
         with patch.object(render_retry, "RETRY_ENABLED", False):
