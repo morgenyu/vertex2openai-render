@@ -150,6 +150,14 @@ class PoolTests(unittest.IsolatedAsyncioTestCase):
         self.assertNotIn("old", self.pool.cooldowns)
         self.assertEqual(self.selected, "old")
 
+    async def test_health_check_does_not_clear_upstream_failure_cooldown(self):
+        await self.pool.start()
+        expiry = time.monotonic() + self.pool.cooldown
+        self.pool.cooldowns["old"] = expiry
+        report = await self.pool.check()
+        self.assertEqual(report["healthy"], 2)
+        self.assertEqual(self.pool.cooldowns["old"], expiry)
+
     def test_error_classification(self):
         for code in (408, 429, 500, 502, 503, 504):
             response = httpx.Response(code, request=httpx.Request("GET", "https://example.com"))

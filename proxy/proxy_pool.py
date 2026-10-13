@@ -81,7 +81,6 @@ class ProxyPool:
             response.raise_for_status()
             delay = response.json().get("delay")
             if isinstance(delay, (int, float)) and not isinstance(delay, bool) and delay >= 0:
-                self.cooldowns.pop(name, None)
                 return True
         except (httpx.HTTPError, ValueError):
             pass
